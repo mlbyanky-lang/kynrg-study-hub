@@ -102,12 +102,72 @@ def initialize_quiz(filtered_df, full_df):
     }
 
 # ==========================================
+# 3-1. 수학 공식 데이터 처리 함수
+# ==========================================
+MATH_FORMULAS_FILE = "math_formulas.csv"
+MATH_REQUIRED_COLUMNS = {"category", "name", "formula"}
+
+@st.cache_data
+def load_math_formulas():
+    try:
+        df = pd.read_csv(MATH_FORMULAS_FILE, encoding="utf-8-sig")
+
+        missing_columns = MATH_REQUIRED_COLUMNS - set(df.columns)
+        if missing_columns:
+            st.error(f"CSV 파일에 필요한 컬럼이 없습니다: {', '.join(missing_columns)}")
+            return None
+
+        df = df.dropna(subset=["category", "name", "formula"])
+        df["category"] = df["category"].astype(str)
+        df["name"] = df["name"].astype(str)
+        df["formula"] = df["formula"].astype(str)
+
+        return df
+
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        st.error(f"수학 공식 파일을 불러오는 중 오류가 발생했습니다: {e}")
+        return None
+
+def reset_math_quiz_stats():
+    st.session_state.math_total_count = 0
+    st.session_state.math_correct_count = 0
+    st.session_state.math_wrong_items = []
+
+def initialize_math_quiz(filtered_df, full_df):
+    target_row = filtered_df.sample(n=1).iloc[0]
+
+    answer = target_row["name"]
+    formula = target_row["formula"]
+    candidates = full_df[full_df["name"] != answer]["name"].drop_duplicates().tolist()
+
+    if len(candidates) >= 3:
+        distractors = random.sample(candidates, 3)
+    else:
+        distractors = candidates
+
+    options = distractors + [answer]
+    random.shuffle(options)
+
+    st.session_state.math_quiz_data = {
+        "formula": formula,
+        "answer": answer,
+        "options": options,
+        "solved": False,
+        "selected": None,
+    }
+
+# ==========================================
 # 4. 사이드바
 # ==========================================
 st.sidebar.title("🛠️ 학습 설정")
 menu = st.sidebar.radio(
     "메뉴 이동",
-    ["📖 단어 학습장", "📝 맞춤형 어휘 테스트", "📖 AI 구문 분석 튜터"]
+    [
+        "📖 단어 학습장", "📝 맞춤형 어휘 테스트", "📖 AI 구문 분석 튜터",
+        "🧮 수학 공식 플래시카드", "🧮 수학 공식 맞추기 퀴즈",
+    ]
 )
 
 selected_file = None
@@ -340,3 +400,161 @@ elif menu == "📖 AI 구문 분석 튜터":
                     st.warning("⚠️ 구글 AI 서버가 일시적으로 혼잡합니다. 5~10초 뒤 다시 시도해주세요.")
                 else:
                     st.error("분석 중 오류가 발생했습니다. 관리자에게 문의하세요.")
+
+# ==========================================
+# 8. 수학 공식 플래시카드
+# ==========================================
+elif menu == "🧮 수학 공식 플래시카드":
+    st.title("🧮 수학 공식 플래시카드")
+    st.markdown("**단원을 선택하고, 공식 이름을 보면서 수식을 떠올려보세요.**")
+    st.divider()
+
+    math_df = load_math_formulas()
+    if math_df is None or math_df.empty:
+        st.warning(f"'{MATH_FORMULAS_FILE}' 파일이 없거나 비어 있습니다.")
+        st.stop()
+
+    if "math_memorized" not in st.session_state:
+        st.session_state.math_memorized = set()
+
+    math_categories = math_df["category"].unique()
+    selected_category = st.selectbox("📂 단원을 선택하세요:", math_categories)
+
+    cat_data = math_df[math_df["category"] == selected_category]
+    total_formulas = len(cat_data)
+
+    memorized_count = sum(
+        1 for index, row in cat_data.iterrows()
+        if f"{selected_category}_{row['name']}_{index}" in st.session_state.math_memorized
+    )
+
+    st.write(f"전체 **{total_formulas}**개 중 **{memorized_count}**개 암기 완료!")
+    st.progress(memorized_count / total_formulas if total_formulas > 0 else 0)
+
+    if st.button("🔄 현재 단원 암기 기록 초기화"):
+        for index, row in cat_data.iterrows():
+            key = f"{selected_category}_{row['name']}_{index}"
+            if key in st.session_state.math_memorized:
+                st.session_state.math_memorized.remove(key)
+        st.rerun()
+
+    st.write("")
+
+    for index, row in cat_data.iterrows():
+        name = row["name"]
+        formula = row["formula"]
+        card_key = f"{selected_category}_{name}_{index}"
+
+        if card_key not in st.session_state.math_memorized:
+            with st.expander(f"**{name}**"):
+                st.latex(formula)
+
+                if st.button("✅ 다 외웠어요!", key=f"btn_math_{card_key}"):
+                    st.session_state.math_memorized.add(card_key)
+                    st.rerun()
+
+    if memorized_count == total_formulas and total_formulas > 0:
+        st.balloons()
+        st.info("🎉 축하합니다! 이 단원의 모든 공식을 완벽하게 암기했습니다.")
+
+# ==========================================
+# 9. 수학 공식 맞추기 퀴즈
+# ==========================================
+elif menu == "🧮 수학 공식 맞추기 퀴즈":
+    st.sidebar.divider()
+    if st.sidebar.button("학습 기록 초기화", key="math_quiz_reset_sidebar"):
+        reset_math_quiz_stats()
+        if "math_quiz_data" in st.session_state:
+            del st.session_state.math_quiz_data
+        st.rerun()
+
+    st.title("🧮 수학 공식 맞추기 퀴즈")
+    st.markdown("**수식을 보고, 그게 어떤 공식인지 맞혀보세요.**")
+
+    math_df = load_math_formulas()
+    if math_df is None or math_df.empty:
+        st.warning(f"'{MATH_FORMULAS_FILE}' 파일이 없거나 비어 있습니다.")
+        st.stop()
+
+    if "math_total_count" not in st.session_state:
+        reset_math_quiz_stats()
+
+    math_categories = math_df["category"].unique()
+    selected_category = st.selectbox("📂 단원을 선택하세요:", math_categories, key="math_quiz_category")
+
+    cat_data = math_df[math_df["category"] == selected_category]
+
+    if cat_data.empty:
+        st.warning("선택한 단원에 공식이 없습니다.")
+        st.stop()
+
+    state_key = f"mathquiz_{selected_category}"
+
+    if (
+        "math_current_state_key" not in st.session_state
+        or st.session_state.math_current_state_key != state_key
+    ):
+        st.session_state.math_current_state_key = state_key
+        if "math_quiz_data" in st.session_state:
+            del st.session_state.math_quiz_data
+
+    if "math_quiz_data" not in st.session_state:
+        initialize_math_quiz(cat_data, math_df)
+
+    total = st.session_state.math_total_count
+    correct = st.session_state.math_correct_count
+    accuracy = round((correct / total) * 100, 1) if total else 0
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("푼 문제", total)
+    col2.metric("정답 수", correct)
+    col3.metric("정답률", f"{accuracy}%")
+
+    quiz = st.session_state.math_quiz_data
+
+    st.divider()
+    st.subheader("Q. 다음은 어떤 공식인가요?")
+    st.latex(quiz["formula"])
+
+    cols = st.columns(2)
+
+    for i, option in enumerate(quiz["options"]):
+        disabled = quiz["solved"]
+
+        if cols[i % 2].button(
+            option,
+            key=f"mathopt_{i}",
+            use_container_width=True,
+            disabled=disabled
+        ):
+            quiz["solved"] = True
+            quiz["selected"] = option
+            st.session_state.math_total_count += 1
+
+            if option == quiz["answer"]:
+                st.session_state.math_correct_count += 1
+            else:
+                st.session_state.math_wrong_items.append({
+                    "formula": quiz["formula"],
+                    "answer": quiz["answer"],
+                    "selected": option,
+                })
+
+            st.rerun()
+
+    if quiz["solved"]:
+        if quiz["selected"] == quiz["answer"]:
+            st.success("🎉 정답!")
+        else:
+            st.error(f"❌ 오답! 정답: {quiz['answer']}")
+
+        if st.button("➡️ 다음 문제", type="primary", key="math_next"):
+            del st.session_state.math_quiz_data
+            st.rerun()
+
+    if st.session_state.math_wrong_items:
+        with st.expander("📌 오답 노트 보기"):
+            for item in reversed(st.session_state.math_wrong_items):
+                st.latex(item["formula"])
+                st.write(f"정답: **{item['answer']}**  /  내가 고른 답: {item['selected']}")
+                st.divider()
