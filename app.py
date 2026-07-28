@@ -105,7 +105,8 @@ def initialize_quiz(filtered_df, full_df):
 # 3-1. 수학 공식 데이터 처리 함수
 # ==========================================
 MATH_FORMULAS_FILE = "math_formulas.csv"
-MATH_REQUIRED_COLUMNS = {"category", "name", "formula"}
+MATH_REQUIRED_COLUMNS = {"subject", "category", "name", "formula"}
+MATH_SUBJECT_ORDER = ["미분", "적분", "선형대수", "다변수미적분", "공학수학"]
 
 @st.cache_data
 def load_math_formulas():
@@ -117,7 +118,8 @@ def load_math_formulas():
             st.error(f"CSV 파일에 필요한 컬럼이 없습니다: {', '.join(missing_columns)}")
             return None
 
-        df = df.dropna(subset=["category", "name", "formula"])
+        df = df.dropna(subset=["subject", "category", "name", "formula"])
+        df["subject"] = df["subject"].astype(str)
         df["category"] = df["category"].astype(str)
         df["name"] = df["name"].astype(str)
         df["formula"] = df["formula"].astype(str)
@@ -129,6 +131,12 @@ def load_math_formulas():
     except Exception as e:
         st.error(f"수학 공식 파일을 불러오는 중 오류가 발생했습니다: {e}")
         return None
+
+def get_subjects_in_order(df):
+    present = set(df["subject"].unique())
+    ordered = [s for s in MATH_SUBJECT_ORDER if s in present]
+    ordered += [s for s in present if s not in MATH_SUBJECT_ORDER]
+    return ordered
 
 def reset_math_quiz_stats():
     st.session_state.math_total_count = 0
@@ -417,10 +425,14 @@ elif menu == "🧮 수학 공식 플래시카드":
     if "math_memorized" not in st.session_state:
         st.session_state.math_memorized = set()
 
-    math_categories = math_df["category"].unique()
+    math_subjects = get_subjects_in_order(math_df)
+    selected_subject = st.selectbox("📚 과목을 선택하세요:", math_subjects)
+
+    subject_df = math_df[math_df["subject"] == selected_subject]
+    math_categories = subject_df["category"].unique()
     selected_category = st.selectbox("📂 단원을 선택하세요:", math_categories)
 
-    cat_data = math_df[math_df["category"] == selected_category]
+    cat_data = subject_df[subject_df["category"] == selected_category]
     total_formulas = len(cat_data)
 
     memorized_count = sum(
@@ -479,16 +491,20 @@ elif menu == "🧮 수학 공식 맞추기 퀴즈":
     if "math_total_count" not in st.session_state:
         reset_math_quiz_stats()
 
-    math_categories = math_df["category"].unique()
+    math_subjects = get_subjects_in_order(math_df)
+    selected_subject = st.selectbox("📚 과목을 선택하세요:", math_subjects, key="math_quiz_subject")
+
+    subject_df = math_df[math_df["subject"] == selected_subject]
+    math_categories = subject_df["category"].unique()
     selected_category = st.selectbox("📂 단원을 선택하세요:", math_categories, key="math_quiz_category")
 
-    cat_data = math_df[math_df["category"] == selected_category]
+    cat_data = subject_df[subject_df["category"] == selected_category]
 
     if cat_data.empty:
         st.warning("선택한 단원에 공식이 없습니다.")
         st.stop()
 
-    state_key = f"mathquiz_{selected_category}"
+    state_key = f"mathquiz_{selected_subject}_{selected_category}"
 
     if (
         "math_current_state_key" not in st.session_state
@@ -499,7 +515,7 @@ elif menu == "🧮 수학 공식 맞추기 퀴즈":
             del st.session_state.math_quiz_data
 
     if "math_quiz_data" not in st.session_state:
-        initialize_math_quiz(cat_data, math_df)
+        initialize_math_quiz(cat_data, subject_df)
 
     total = st.session_state.math_total_count
     correct = st.session_state.math_correct_count
