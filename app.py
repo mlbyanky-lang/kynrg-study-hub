@@ -10,6 +10,31 @@ st.set_page_config(
     layout="wide"
 )
 
+# 퀴즈 보기 버튼의 긴 뜻이 말줄임(...)으로 잘리지 않고 줄바꿈되도록
+st.markdown(
+    """
+    <style>
+    div.stButton > button,
+    div[data-testid="stButton"] button {
+        height: auto;
+        min-height: 2.5rem;
+        white-space: normal;
+    }
+    div.stButton > button p,
+    div.stButton > button div,
+    div[data-testid="stButton"] button p,
+    div[data-testid="stButton"] button div {
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        overflow-wrap: anywhere;
+        word-break: keep-all;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 REQUIRED_COLUMNS = {"day", "word", "meaning"}
 MAX_ANALYSIS_LENGTH = 1500
 
