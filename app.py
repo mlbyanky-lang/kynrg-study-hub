@@ -67,13 +67,18 @@ if not st.session_state.authenticated:
 # ==========================================
 MODEL_NAME = "gpt-5.6-terra"
 
+client = None
+client_error = None
+
 try:
     client = OpenAI(
-        api_key=st.secrets["ris45wqxa4r07l8vzksixu44ma0oclcq"],
-        base_url=st.secrets["https://api.kimyoung.work/llm-gateway/openai/v1"],
+        api_key=st.secrets["OPENAI_API_KEY"],
+        base_url=st.secrets["OPENAI_BASE_URL"],
     )
-except Exception:
-    client = None
+except Exception as e:
+    # 자세한 원인은 Streamlit Cloud의 Manage app 로그에서 확인
+    client_error = type(e).__name__
+    print(f"[AI 설정 오류] {type(e).__name__}: {e}")
 
 # ==========================================
 # 3. 단어장 데이터 처리 함수 (공용)
@@ -393,6 +398,7 @@ elif menu == "📖 AI 구문 분석 튜터":
 
     if client is None:
         st.error("API 키 설정에 문제가 있습니다. 관리자에게 문의하세요.")
+        st.caption(f"오류 종류: {client_error}")
         st.stop()
 
     user_input = st.text_area(
@@ -438,6 +444,7 @@ elif menu == "📖 AI 구문 분석 튜터":
                     st.warning("⚠️ AI 서버가 일시적으로 혼잡합니다. 5~10초 뒤 다시 시도해주세요.")
                 else:
                     st.error("분석 중 오류가 발생했습니다. 관리자에게 문의하세요.")
+                    st.caption(f"오류 종류: {type(e).__name__}")
 
 # ==========================================
 # 8. 수학 공식 플래시카드
