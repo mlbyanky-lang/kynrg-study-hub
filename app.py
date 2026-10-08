@@ -72,8 +72,8 @@ client_error = None
 
 try:
     client = OpenAI(
-        api_key=st.secrets["OPENAI_API_KEY"],
-        base_url=st.secrets["OPENAI_BASE_URL"],
+        api_key=st.secrets["ris45wqxa4r07l8vzksixu44ma0oclcq"],
+        base_url=st.secrets["https://api.kimyoung.work/llm-gateway/openai/v1"],
     )
 except Exception as e:
     # 자세한 원인은 Streamlit Cloud의 Manage app 로그에서 확인
