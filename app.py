@@ -83,8 +83,8 @@ try:
         )
     else:
         client = OpenAI(
-            api_key=st.secrets["ris45wqxa4r07l8vzksixu44ma0oclcq"],
-            base_url=st.secrets["https://api.kimyoung.work/llm-gateway/openai/v1"],
+            api_key=st.secrets["OPENAI_API_KEY"],
+            base_url=st.secrets["OPENAI_BASE_URL"],
         )
 except Exception as e:
     client_error = type(e).__name__
