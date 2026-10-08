@@ -67,18 +67,28 @@ if not st.session_state.authenticated:
 # ==========================================
 MODEL_NAME = "gpt-5.6-terra"
 
+REQUIRED_SECRETS = ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
+
 client = None
 client_error = None
 
 try:
-    client = OpenAI(
-        api_key=st.secrets["ris45wqxa4r07l8vzksixu44ma0oclcq"],
-        base_url=st.secrets["https://api.kimyoung.work/llm-gateway/openai/v1"],
-    )
+    # 값은 표시하지 않고 이름만 확인
+    missing_secrets = [name for name in REQUIRED_SECRETS if name not in st.secrets]
+
+    if missing_secrets:
+        client_error = (
+            f"Secrets에 없는 이름: {', '.join(missing_secrets)} / "
+            f"앱이 현재 읽은 이름: {', '.join(st.secrets.keys()) or '없음'}"
+        )
+    else:
+        client = OpenAI(
+            api_key=st.secrets["ris45wqxa4r07l8vzksixu44ma0oclcq"],
+            base_url=st.secrets["https://api.kimyoung.work/llm-gateway/openai/v1"],
+        )
 except Exception as e:
-    # 자세한 원인은 Streamlit Cloud의 Manage app 로그에서 확인
     client_error = type(e).__name__
-    print(f"[AI 설정 오류] {type(e).__name__}: {e}")
+    print(f"[AI 설정 오류] {type(e).__name__}: {e}", flush=True)
 
 # ==========================================
 # 3. 단어장 데이터 처리 함수 (공용)
@@ -436,7 +446,7 @@ elif menu == "📖 AI 구문 분석 튜터":
             except Exception as e:
                 error_message = str(e)
                 # 실제 오류 원인은 Streamlit Cloud의 Manage app 로그에서 확인
-                print(f"[AI 구문 분석 오류] {type(e).__name__}: {error_message}")
+                print(f"[AI 구문 분석 오류] {type(e).__name__}: {error_message}", flush=True)
 
                 if "429" in error_message:
                     st.warning("⚠️ 현재 요청이 많습니다. 잠시 후 다시 시도해주세요.")
