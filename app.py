@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+from openai import OpenAI
 import pandas as pd
 import random
 import os
@@ -63,14 +63,17 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# 2. AI 설정
+# 2. AI 설정 (회사 LLM 게이트웨이 - OpenAI 모델)
 # ==========================================
+MODEL_NAME = "gpt-5.6-terra"
+
 try:
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    client = OpenAI(
+        api_key=st.secrets["ris45wqxa4r07l8vzksixu44ma0oclcq"],
+        base_url=st.secrets["https://api.kimyoung.work/llm-gateway/openai/v1"],
+    )
 except Exception:
-    model = None
+    client = None
 
 # ==========================================
 # 3. 단어장 데이터 처리 함수 (공용)
@@ -388,7 +391,7 @@ elif menu == "📖 AI 구문 분석 튜터":
     st.title("📖 AI 구문 분석 튜터")
     st.info("🚀 노량진 캠퍼스 전용 AI 분석 서버 가동 중")
 
-    if model is None:
+    if client is None:
         st.error("API 키 설정에 문제가 있습니다. 관리자에게 문의하세요.")
         st.stop()
 
@@ -420,17 +423,19 @@ elif menu == "📖 AI 구문 분석 튜터":
 
         with st.spinner("AI가 구문을 정밀 분석 중입니다..."):
             try:
-                response = model.generate_content(prompt)
+                response = client.responses.create(model=MODEL_NAME, input=prompt)
                 st.markdown("---")
-                st.markdown(response.text)
+                st.markdown(response.output_text)
 
             except Exception as e:
                 error_message = str(e)
+                # 실제 오류 원인은 Streamlit Cloud의 Manage app 로그에서 확인
+                print(f"[AI 구문 분석 오류] {type(e).__name__}: {error_message}")
 
                 if "429" in error_message:
                     st.warning("⚠️ 현재 요청이 많습니다. 잠시 후 다시 시도해주세요.")
                 elif "503" in error_message:
-                    st.warning("⚠️ 구글 AI 서버가 일시적으로 혼잡합니다. 5~10초 뒤 다시 시도해주세요.")
+                    st.warning("⚠️ AI 서버가 일시적으로 혼잡합니다. 5~10초 뒤 다시 시도해주세요.")
                 else:
                     st.error("분석 중 오류가 발생했습니다. 관리자에게 문의하세요.")
 
