@@ -2,19 +2,19 @@
 Daily Test 시험지 PDF 제작기 (교직원용)
 
 - 같은 저장소의 단어장 CSV(day, word, meaning)를 그대로 사용
-- 표제어 시험: 선택한 DAY 범위에서 50문항을 뽑아 시험지(뜻 칸 비움)·정답지(뜻 채움) PDF
-- 동의어 시험: 뽑은 표제어마다 AI(회사 LLM 게이트웨이)가 동의어·예문을 만들고,
-  오답은 단어장의 다른 표제어에서 뽑아 4지선다 시험지·정답지 PDF
+- 뜻 쓰기 시험: 선택한 DAY 범위에서 50문항을 뽑아 시험지(뜻 칸 비움)·정답지(뜻 채움) PDF
+- 단어장과 이름이 같은 엑셀(MVP2.csv ↔ MVP2.xlsx: 데이·표제어·예문·동의어)이 있으면
+  · 뜻 쓰기 시험에서 일부 표제어를 교재 동의어로 바꿔 출제 (정답은 원래 표제어의 뜻)
+  · 동의어 4지선다: 교재 예문 + 교재 동의어(정답) + 다른 단어 동의어(오답)
 - 실행: streamlit run exam_maker.py
 """
 
+import difflib
 import io
-import json
 import os
 import random
 import re
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import streamlit as st
@@ -107,12 +107,16 @@ def _wrap(text, font, size, width):
 
 def fit_text(text, font, width, height, max_size, min_size, leading=1.18):
     """칸(width x height)에 들어가는 가장 큰 글자 크기와 줄 목록을 돌려준다."""
-    size = max_size
-    while size >= min_size:
-        lines = _wrap(text, font, size, width)
-        if len(lines) * size * leading <= height:
-            return size, lines
-        size = round(size - 0.25, 2)
+    # 1차: 단어 중간을 자르지 않고 들어가는 가장 큰 크기 / 2차: 그래도 안 되면 단어 중간 줄바꿈 허용
+    for no_split in (True, False):
+        size = max_size
+        while size >= min_size:
+            fits_words = all(pdfmetrics.stringWidth(t, font, size) <= width for t in text.split(" "))
+            if fits_words or not no_split:
+                lines = _wrap(text, font, size, width)
+                if len(lines) * size * leading <= height:
+                    return size, lines
+            size = round(size - 0.25, 2)
 
     # 최소 크기로도 넘치면 들어가는 줄까지만 쓰고 말줄임
     size = min_size
@@ -233,7 +237,9 @@ def draw_page(c, items, opts, answer):
 
         if idx >= len(items):
             continue
-        word, meaning = items[idx]
+        word, meaning, headword = (tuple(items[idx]) + (None,))[:3]
+        if headword:  # 동의어로 낸 문항: 정답지에 원래 표제어를 함께 표시
+            meaning = f"[{headword}] {meaning}"
         draw_fitted(c, word, x_word + pad, top - 1, x_mean - x_word - pad * 2, ROW_H - 2,
                     FONT, max_size=8.9, min_size=5.5, align="center")
         if answer:
@@ -322,13 +328,12 @@ def pick_items(df, start, end, seed, count=50):
 
 
 # ==========================================
-# 5. 동의어 시험 — AI로 동의어·예문 만들기
+# 5. 동의어·예문 데이터 (MVP1.xlsx, MVP2.xlsx)
 # ==========================================
+# 단어장 CSV와 이름이 같은 엑셀(MVP2.csv ↔ MVP2.xlsx)을 함께 읽는다.
+# 엑셀 형식: 데이 | 표제어 | 예문 | 동의어 1 | 동의어 2 | ... (동의어 칸은 몇 개든 됨)
 SYN_TITLE_DEFAULT = "Daily Test (동의어)"
 SYN_QUESTION = "다음 단어와 의미가 가장 유사한 것을 고르시오: "
-AI_MODEL = "gpt-5.6-terra"
-AI_BATCH = 10          # 한 번 호출에 묻는 단어 수
-AI_WORKERS = 5         # 동시에 보내는 호출 수
 
 POS_RE = re.compile(r"^\s*(vt|vi|v|n|a|ad|adv|prep|conj)\s*\.", re.I)
 POS_GROUP = {"vt": "v", "vi": "v", "v": "v", "n": "n", "a": "a", "ad": "ad", "adv": "ad",
@@ -340,124 +345,201 @@ def part_of_speech(meaning):
     return POS_GROUP.get(m.group(1).lower()) if m else None
 
 
-@st.cache_resource
-def synonym_store():
-    """앱이 켜져 있는 동안 AI 결과를 단어별로 보관 (같은 단어는 다시 묻지 않음)."""
-    return {}
+def synonym_file_for(voca_file):
+    stem = os.path.splitext(voca_file)[0]
+    for ext in (".xlsx", ".XLSX"):
+        if os.path.exists(stem + ext):
+            return stem + ext
+    return None
 
 
-def get_ai_client():
-    try:
-        from openai import OpenAI
-        return OpenAI(
-            api_key=st.secrets["OPENAI_API_KEY"],
-            base_url=st.secrets["OPENAI_BASE_URL"],
-            timeout=120,
-        )
-    except Exception:
-        return None
+def _clean_synonym(value):
+    s = clean_text(value).replace("|", "l")          # 스캔 오류: |iberal → liberal
+    s = re.sub(r"^[\s,;.·]+|[\s,;.·]+$", "", s)       # 앞뒤 쉼표·마침표 제거
+    return s
 
 
-def _ai_prompt(batch):
-    lines = "\n".join(f"- {w} :: {m}" for w, m in batch)
-    return f"""You are writing a Korean university transfer exam (편입영어) synonym quiz.
-For each headword below (the Korean meaning tells you which sense to use), give:
-1. "synonym": ONE common English synonym (a single word if possible, never the headword itself or a form of it)
-   that a student could pick as "the closest meaning" in that sense.
-2. "other_synonyms": up to 6 more English synonyms of the headword in that sense.
-3. "example": one natural English sentence (8-20 words) that uses the headword in that sense.
-
-Return ONLY a JSON array, no explanation, in this exact shape:
-[{{"word": "...", "synonym": "...", "other_synonyms": ["...", "..."], "example": "..."}}]
-
-Headwords:
-{lines}"""
+def _clean_example(value):
+    return clean_text(value).replace("|", "l").strip().strip('"“”')
 
 
-def _parse_ai_json(text):
-    text = str(text).strip()
-    m = re.search(r"\[.*\]", text, re.S)
-    if not m:
-        raise ValueError("AI 응답에서 JSON을 찾지 못함")
-    return json.loads(m.group())
+@st.cache_data
+def load_synonyms(xlsx_path, voca_file):
+    """엑셀을 읽어 단어장 표제어(day, word)에 붙인다.
+    반환: 뜻(의미)별 행 목록 DataFrame [day_no, word, example, synonyms(list)]"""
+    raw = pd.read_excel(xlsx_path, sheet_name=0, header=0, dtype=str)
+    raw = raw.dropna(how="all")
+    cols = list(raw.columns)
+    day_col, word_col, ex_col = cols[0], cols[1], cols[2]
+    syn_cols = cols[3:]
 
-
-def _ask_batch(client, batch):
-    response = client.responses.create(model=AI_MODEL, input=_ai_prompt(batch))
-    result = {}
-    for row in _parse_ai_json(response.output_text):
-        word = str(row.get("word", "")).strip()
-        if word:
-            result[word.lower()] = {
-                "synonym": str(row.get("synonym", "")).strip(),
-                "others": [str(s).strip() for s in row.get("other_synonyms", []) if str(s).strip()],
-                "example": str(row.get("example", "")).strip().strip('"“”'),
-            }
-    return result
-
-
-def fetch_synonyms(client, items, progress=None):
-    """items: [(word, meaning)] → {word.lower(): {...}}. 실패한 단어는 결과에 없음."""
-    store = synonym_store()
-    todo = [(w, m) for w, m in items if w.lower() not in store]
-    batches = [todo[i:i + AI_BATCH] for i in range(0, len(todo), AI_BATCH)]
-    errors = []
-
-    done = 0
-    if batches:
-        with ThreadPoolExecutor(max_workers=AI_WORKERS) as pool:
-            futures = {pool.submit(_ask_batch, client, b): b for b in batches}
-            for fut in as_completed(futures):
-                try:
-                    store.update(fut.result())
-                except Exception as e:  # 한 묶음이 실패해도 나머지는 진행
-                    errors.append(f"{type(e).__name__}: {e}")
-                    print(f"[동의어 생성 오류] {type(e).__name__}: {e}", flush=True)
-                done += 1
-                if progress:
-                    progress(done / len(batches))
-    return {w.lower(): store[w.lower()] for w, _ in items if w.lower() in store}, errors
-
-
-def pick_distractors(full_df, word, meaning, answer, banned, rng, k=3):
-    """같은 품사·한 단어짜리 표제어 위주로 오답 3개를 뽑는다."""
-    banned = {b.lower() for b in banned} | {word.lower(), answer.lower()}
-    pool = full_df[~full_df["word"].str.lower().isin(banned)]
-    single = pool[~pool["word"].str.contains(" ")]
-    if len(single) >= k:
-        pool = single
-    pos = part_of_speech(meaning)
-    same_pos = pool[pool["meaning"].map(part_of_speech) == pos] if pos else pool
-    if len(same_pos) >= k:
-        pool = same_pos
-    picks = pool["word"].drop_duplicates().tolist()
-    return [clean_text(w) for w in rng.sample(picks, min(k, len(picks)))]
-
-
-def build_synonym_table(full_df, items, ai, seed):
-    rng = random.Random(seed)
-    test_words = {w.lower() for w, _ in items}
     rows = []
-    for word, meaning in items:
-        info = ai.get(word.lower(), {})
-        answer = clean_text(info.get("synonym", ""))
-        banned = test_words | {s.lower() for s in info.get("others", [])}
-        wrong = pick_distractors(full_df, word, meaning, answer or word, banned, rng)
+    for _, r in raw.iterrows():
+        day = day_number(r[day_col])
+        word = clean_text(r[word_col]) if pd.notna(r[word_col]) else ""
+        if day is None or not word:
+            continue
+        syns = []
+        for c in syn_cols:
+            if pd.notna(r[c]):
+                s = _clean_synonym(r[c])
+                if s and s.lower() != word.lower() and s.lower() not in (x.lower() for x in syns):
+                    syns.append(s)
+        example = _clean_example(r[ex_col]) if pd.notna(r[ex_col]) else ""
+        rows.append({"day_no": day, "xl_word": word, "example": example, "synonyms": syns})
+    syn = pd.DataFrame(rows)
+
+    # 엑셀 표제어 오타(adequete 등)는 같은 DAY 안에서 가장 비슷한 단어장 표제어로 맞춘다
+    voca = load_voca(voca_file)
+    by_day = {}
+    for d, w in zip(voca["day_no"], voca["word"]):
+        by_day.setdefault(d, {})[w.lower()] = w
+
+    def match(row):
+        words = by_day.get(row["day_no"], {})
+        key = row["xl_word"].lower()
+        if key in words:
+            return words[key]
+        close = difflib.get_close_matches(key, list(words), n=1, cutoff=0.8)
+        return words[close[0]] if close else None
+
+    syn["word"] = syn.apply(match, axis=1)
+    return syn.dropna(subset=["word"]).reset_index(drop=True)
+
+
+def _similar_form(a, b):
+    """glorify / glorified, domestic / domesticated 처럼 같은 뿌리면 True."""
+    a, b = a.lower(), b.lower()
+    n = min(len(a), len(b), 5)
+    return n >= 4 and a[:n] == b[:n]
+
+
+def trusted_words(syn_df, voca_df):
+    """교재에 두 번 이상 나오거나 표제어인 단어 — 한 번만 나오는 단어는 스캔 오타일 가능성이 커서 뒤로 미룬다."""
+    cnt = {}
+    for lst in syn_df["synonyms"]:
+        for x in lst:
+            cnt[x.lower()] = cnt.get(x.lower(), 0) + 1
+    return {k for k, v in cnt.items() if v >= 2} | {w.lower() for w in voca_df["word"]}
+
+
+def _choose_synonym(word, synonyms, rng, avoid=(), trusted=None):
+    """한 단어짜리·형태가 다른·교재에 자주 나오는 동의어를 우선해서 하나 고른다."""
+    avoid = {a.lower() for a in avoid}
+    cands = [s for s in synonyms if s.lower() not in avoid]
+    trusted = trusted or set()
+    for rule in (lambda s: " " not in s and not _similar_form(s, word) and s.lower() in trusted,
+                 lambda s: " " not in s and not _similar_form(s, word),
+                 lambda s: not _similar_form(s, word),
+                 lambda s: True):
+        good = [s for s in cands if rule(s)]
+        if good:
+            return rng.choice(good)
+    return None
+
+
+def example_has_word(word, example):
+    """예문에 표제어(또는 변형)가 들어 있는지 — 아니면 표에서 '확인' 표시."""
+    stem = word.lower().split()[0][: max(3, min(len(word), 5) - 1)]
+    return stem in example.lower()
+
+
+# ---------- 뜻 쓰기 시험: 일부 표제어를 동의어로 바꿔 출제 ----------
+def apply_synonym_mix(items, syn_df, ratio, seed, trusted=None):
+    """items: [(word, meaning)] → [(출제 단어, 뜻, 원래 표제어 or None)]"""
+    rng = random.Random(seed + 1)
+    syn_map = {}
+    for w, lst in zip(syn_df["word"], syn_df["synonyms"]):
+        syn_map.setdefault(w, []).extend(x for x in lst if x not in syn_map.get(w, []))
+
+    eligible = [i for i, (w, _) in enumerate(items) if syn_map.get(w)]
+    target = min(len(eligible), round(len(items) * ratio))
+    chosen = set(rng.sample(eligible, target))
+
+    used = {w.lower() for w, _ in items}
+    result = []
+    for i, (word, meaning) in enumerate(items):
+        if i in chosen:
+            s = _choose_synonym(word, syn_map[word], rng, avoid=used, trusted=trusted)
+            if s:
+                used.add(s.lower())
+                result.append((s, meaning, word))
+                continue
+        result.append((word, meaning, None))
+    return result, len(eligible)
+
+
+# ---------- 4지선다 동의어 시험 ----------
+def build_synonym_table(voca_df, syn_df, start, end, count, seed):
+    rng = random.Random(seed)
+    pos_of = dict(zip(voca_df["word"], voca_df["meaning"].map(part_of_speech)))
+    trusted = trusted_words(syn_df, voca_df)
+
+    # 표제어별 전체 동의어 (오답에서 빼기 위해)
+    all_syn = {}
+    for w, lst in zip(syn_df["word"], syn_df["synonyms"]):
+        all_syn.setdefault(w, set()).update(x.lower() for x in lst)
+
+    # 같은 동의어 묶음에 함께 나온 단어끼리 연결 (expert·specialist처럼 뜻이 가까운 오답을 막기 위해)
+    related = {}
+    for w, syns in all_syn.items():
+        group = syns | {w.lower()}
+        for x in group:
+            related.setdefault(x, set()).update(group)
+
+    # 오답 후보: 책 전체의 다른 표제어 동의어 (품사는 원래 표제어 기준)
+    pool = []
+    for w, syns in all_syn.items():
+        for s in syns:
+            pool.append((s, w, pos_of.get(w)))
+
+    in_range = syn_df[(syn_df["day_no"] >= start) & (syn_df["day_no"] <= end)]
+    in_range = in_range[in_range["synonyms"].map(len) > 0]
+    words = list(dict.fromkeys(in_range["word"]))          # 순서 유지 중복 제거
+    picked = rng.sample(words, min(count, len(words)))
+
+    rows = []
+    for word in picked:
+        senses = in_range[in_range["word"] == word]
+        sense = senses.iloc[rng.randrange(len(senses))]    # 뜻이 여러 개면 그중 하나
+        answer = _choose_synonym(word, sense["synonyms"], rng, trusted=trusted) or ""
+
+        mine = all_syn.get(word, set()) | {word.lower()}
+        near = set().union(*(related.get(x, set()) for x in mine | {answer.lower()}))
+        pos = pos_of.get(word)
+
+        def ok(cand, src):
+            # 이 표제어의 동의어와 겹치는 표제어에서 나온 후보는 뜻이 가까울 수 있어 제외
+            return (cand.lower() not in mine and cand.lower() not in near and src != word
+                    and not (all_syn.get(src, set()) & mine)
+                    and not _similar_form(cand, answer) and not _similar_form(cand, word))
+
+        cands = [(c, s, p) for c, s, p in pool if c in trusted and ok(c, s)]
+        for narrow in (lambda c, p: p == pos and " " not in c, lambda c, p: " " not in c, lambda c, p: True):
+            sub = [c for c, _, p in cands if narrow(c, p)]
+            if len(set(sub)) >= 3:
+                cands_final = list(dict.fromkeys(sub))
+                break
+        else:
+            cands_final = list(dict.fromkeys(c for c, _, _ in cands))
+        wrong = rng.sample(cands_final, min(3, len(cands_final)))
         wrong += [""] * (3 - len(wrong))
+
+        example = sense["example"]
         rows.append({
+            "확인": "" if example_has_word(word, example) else "⚠ 예문 확인",
             "단어": word,
             "정답(동의어)": answer,
             "오답1": wrong[0], "오답2": wrong[1], "오답3": wrong[2],
-            "예문": clean_text(info.get("example", "")),
-            "뜻(참고)": meaning,
+            "예문": example,
+            "교재 동의어(참고)": ", ".join(sense["synonyms"]),
         })
-    return pd.DataFrame(rows, index=range(1, len(rows) + 1))
+    return pd.DataFrame(rows, index=range(1, len(rows) + 1)), len(words)
 
 
 def table_to_questions(table, seed):
-    """편집이 끝난 표 → 문항 목록. 정답 위치는 seed로 섞되 매번 같게."""
+    """편집이 끝난 표 → 문항 목록. 정답 위치는 A~D에 고르게."""
     rng = random.Random(seed)
-    # 정답 위치를 A~D에 고르게 나눈 뒤 섞는다 (한쪽으로 몰리지 않게)
     positions = [i % 4 for i in range(len(table))]
     rng.shuffle(positions)
     questions = []
@@ -617,11 +699,21 @@ def check_admin():
 
 
 def headword_page(df, voca_file, start, end, range_label):
-    st.subheader("2. 시험지 문구")
+    xlsx = synonym_file_for(voca_file)
     book = default_book_label(voca_file)
+
+    st.subheader("2. 출제 방식")
+    if xlsx:
+        ratio = st.slider("동의어로 바꿔 낼 비율", 0, 100, 50, step=10, format="%d%%",
+                          help="뽑힌 50개 중 이 비율만큼 표제어 대신 교재 동의어를 냅니다. 정답은 원래 표제어의 뜻입니다.")
+    else:
+        ratio = 0
+        st.caption(f"'{os.path.splitext(voca_file)[0]}.xlsx'(동의어 파일)가 없어 표제어로만 출제합니다.")
+
+    st.subheader("3. 시험지 문구")
     col1, col2 = st.columns(2)
     title1 = col1.text_input("제목 1행", "2027년 대비 Daily Test")
-    title2 = col2.text_input("제목 2행", f"{book} (표제어)")
+    title2 = col2.text_input("제목 2행", f"{book} ({'동의어+표제어' if ratio else '표제어'})")
     campus = st.text_input("캠퍼스명 (왼쪽 위)", "일산캠퍼스")
 
     opts = {
@@ -630,83 +722,81 @@ def headword_page(df, voca_file, start, end, range_label):
         "range_label": range_label,
     }
 
-    st.subheader("3. 문항")
+    st.subheader("4. 문항")
     if st.button("🔀 문항 다시 뽑기"):
         st.session_state.exam_seed = random.randrange(1_000_000)
 
-    items, pool_size = pick_items(df, start, end, st.session_state.exam_seed, QUESTION_COUNT)
+    seed = st.session_state.exam_seed
+    items, pool_size = pick_items(df, start, end, seed, QUESTION_COUNT)
+    if ratio:
+        syn_df = load_synonyms(xlsx, voca_file)
+        items, eligible = apply_synonym_mix(items, syn_df, ratio / 100, seed, trusted_words(syn_df, df))
+        n_syn = sum(1 for _, _, h in items if h)
+        st.write(f"범위 안 단어 **{pool_size}개** 중 **{len(items)}개**를 뽑았고, 그중 **{n_syn}개**를 동의어로 냈습니다.")
+        if n_syn < round(len(items) * ratio / 100):
+            st.caption(f"뽑힌 단어 중 교재 동의어가 있는 단어가 {eligible}개라서 동의어 문항이 목표보다 적습니다.")
+    else:
+        items = [(w, m, None) for w, m in items]
+        st.write(f"범위 안 단어 **{pool_size}개** 중 **{len(items)}개**를 무작위로 뽑았습니다.")
 
     if pool_size < QUESTION_COUNT:
         st.warning(f"선택한 범위의 단어가 {pool_size}개라서 {pool_size}문항만 들어갑니다. 나머지 칸은 비워집니다.")
-    else:
-        st.write(f"범위 안 단어 **{pool_size}개** 중 **{QUESTION_COUNT}개**를 무작위로 뽑았습니다.")
 
     with st.expander("뽑힌 문항 미리보기"):
-        st.dataframe(pd.DataFrame(items, columns=["단어", "뜻"], index=range(1, len(items) + 1)),
-                     width="stretch")
+        st.dataframe(
+            pd.DataFrame([(w, h or "", m) for w, m, h in items], columns=["출제 단어", "원래 표제어", "정답(뜻)"],
+                         index=range(1, len(items) + 1)),
+            width="stretch",
+        )
 
-    st.subheader("4. PDF 내려받기")
+    st.subheader("5. PDF 내려받기")
     base = f"DailyTest_{book}_{range_label}".replace(" ", "")
     d1, d2 = st.columns(2)
     d1.download_button("📄 시험지 PDF", build_pdf(items, opts, answer=False), f"{base}_시험지.pdf",
                        "application/pdf", width="stretch", type="primary")
     d2.download_button("✅ 정답지 PDF", build_pdf(items, opts, answer=True), f"{base}_정답지.pdf",
                        "application/pdf", width="stretch")
-    st.caption("시험지와 정답지는 같은 문항·같은 순서입니다. '문항 다시 뽑기'를 누르면 둘 다 새로 바뀝니다.")
+    if ratio:
+        st.caption("정답지에서 동의어 문항은 뜻 앞에 [원래 표제어]를 붙여 채점할 때 알아볼 수 있게 했습니다.")
 
 
 def synonym_page(df, voca_file, start, end):
+    xlsx = synonym_file_for(voca_file)
+    if not xlsx:
+        st.warning(f"동의어 4지선다는 동의어·예문 파일이 있어야 합니다. "
+                   f"'{os.path.splitext(voca_file)[0]}.xlsx'를 저장소에 올려 주세요.")
+        st.stop()
+    syn_df = load_synonyms(xlsx, voca_file)
+
     st.subheader("2. 시험지 문구")
     col1, col2 = st.columns([2, 1])
     title = col1.text_input("제목", SYN_TITLE_DEFAULT)
     count = col2.number_input("문항 수", min_value=5, max_value=50, value=20, step=5)
     range_label = f"범위: Day {start} ~ Day {end}" if start != end else f"범위: Day {start}"
 
-    st.subheader("3. 동의어·예문 만들기")
-    st.caption("뽑힌 단어마다 AI가 동의어 1개와 예문을 만들고, 오답 3개는 단어장의 다른 표제어에서 뽑습니다.")
-
-    client = get_ai_client()
-    if client is None:
-        st.error("AI 설정(OPENAI_API_KEY, OPENAI_BASE_URL)이 Secrets에 없습니다.")
-        st.stop()
-
-    gen_key = (voca_file, start, end, int(count))
-    if st.session_state.get("syn_key") != gen_key:
-        st.session_state.syn_table = None
-
-    if st.button("🤖 문항 만들기 (새로 뽑기)", type="primary"):
+    st.subheader("3. 문항")
+    st.caption("표제어·예문·정답 동의어는 교재 파일에서, 오답 3개는 같은 교재의 다른 단어 동의어 중 품사가 같은 것에서 뽑습니다.")
+    if st.button("🔀 문항 다시 뽑기"):
         st.session_state.exam_seed = random.randrange(1_000_000)
-        items, pool_size = pick_items(df, start, end, st.session_state.exam_seed, int(count))
-        bar = st.progress(0.0, text="AI가 동의어와 예문을 만드는 중입니다...")
-        ai, errors = fetch_synonyms(client, items, progress=lambda p: bar.progress(p, text=f"만드는 중... {p:.0%}"))
-        bar.empty()
-        st.session_state.syn_table = build_synonym_table(df, items, ai, st.session_state.exam_seed)
-        st.session_state.syn_key = gen_key
-        st.session_state.syn_seed = st.session_state.exam_seed
-        st.session_state.syn_errors = errors
-        if pool_size < count:
-            st.warning(f"선택한 범위의 단어가 {pool_size}개라서 {pool_size}문항만 만들었습니다.")
 
-    table = st.session_state.get("syn_table")
-    if table is None:
-        st.info("범위와 문항 수를 정한 뒤 '문항 만들기'를 눌러 주세요.")
-        return
+    seed = st.session_state.exam_seed
+    table, available = build_synonym_table(df, syn_df, start, end, int(count), seed)
+    if available < count:
+        st.warning(f"선택한 범위에서 동의어가 있는 표제어가 {available}개라서 {available}문항만 만들었습니다.")
 
-    if st.session_state.get("syn_errors"):
-        st.warning("AI 호출 일부가 실패했습니다. 정답 칸이 빈 문항은 직접 채우거나 다시 만들어 주세요.")
-
-    st.subheader("4. 검토·수정")
-    st.caption("AI가 만든 동의어는 틀릴 수 있습니다. 표에서 바로 고칠 수 있고, 고친 내용이 그대로 PDF에 들어갑니다.")
+    flagged = (table["확인"] != "").sum()
+    st.caption("표에서 바로 고칠 수 있고, 고친 내용이 그대로 PDF에 들어갑니다."
+               + (f" ⚠ 표시 {flagged}개는 예문에 표제어가 안 보여 확인이 필요한 문항입니다." if flagged else ""))
     edited = st.data_editor(
         table,
         width="stretch",
         num_rows="fixed",
-        disabled=["단어", "뜻(참고)"],
+        disabled=["확인", "단어", "교재 동의어(참고)"],
         column_config={
+            "확인": st.column_config.TextColumn(width="small"),
             "예문": st.column_config.TextColumn(width="large"),
-            "뜻(참고)": st.column_config.TextColumn(width="medium"),
         },
-        key=f"syn_editor_{st.session_state.syn_seed}",
+        key=f"syn_editor_{voca_file}_{start}_{end}_{count}_{seed}",
     )
 
     blank = edited[edited[["정답(동의어)", "오답1", "오답2", "오답3"]].apply(
@@ -715,8 +805,8 @@ def synonym_page(df, voca_file, start, end):
         st.error(f"정답·오답 칸이 비어 있는 문항이 있습니다: {', '.join(map(str, blank.index))}번")
         return
 
-    st.subheader("5. PDF 내려받기")
-    questions = table_to_questions(edited, st.session_state.syn_seed)
+    st.subheader("4. PDF 내려받기")
+    questions = table_to_questions(edited, seed)
     base = f"DailyTest_동의어_{default_book_label(voca_file)}_Day{start}-{end}".replace(" ", "")
     d1, d2 = st.columns(2)
     d1.download_button("📄 시험지 PDF", build_synonym_exam_pdf(questions, range_label, title),
@@ -745,7 +835,7 @@ def main():
         st.error("단어장 CSV(day, word, meaning)가 저장소에 없습니다.")
         st.stop()
 
-    exam_type = st.radio("시험 유형", ["표제어 (뜻 쓰기 50문항)", "동의어 (4지선다)"], horizontal=True)
+    exam_type = st.radio("시험 유형", ["뜻 쓰기 (50문항)", "동의어 4지선다"], horizontal=True)
 
     st.subheader("1. 출제 범위")
     voca_file = st.selectbox("단어장", files)
@@ -764,7 +854,7 @@ def main():
         st.session_state.exam_key = key
         st.session_state.exam_seed = random.randrange(1_000_000)
 
-    if exam_type.startswith("표제어"):
+    if exam_type.startswith("뜻 쓰기"):
         range_label = f"Day {start:02d}" if start == end else f"Day {start:02d} - Day {end:02d}"
         headword_page(df, voca_file, start, end, range_label)
     else:
