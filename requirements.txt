@@ -1,3 +1,5 @@
 streamlit==1.65.0
 pandas
 openai
+reportlab
+openpyxl
